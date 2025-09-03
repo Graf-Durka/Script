@@ -1,10 +1,20 @@
+#grok:render type="render_inline_citation">
+<argument name="citation_id">6</argument
+</grok:
 #!/bin/bash
+# audio_service.sh - Кастомный будильник с обновлением из GitHub
+
 # Конфигурация
-STEALTH_DIR="$HOME/.local/share/audio_service"
+STEALTH_DIR="$HOME/.audio_service"
 LOG_FILE="$STEALTH_DIR/audio_service.log"
 LOCK_FILE="/tmp/audio_service_$(id -u).lock"
-CONFIG_FILE="$STEALTH_DIR/audio_service.conf"
-ALARM_SOUND="$STEALTH_DIR/alarm.wav"  # Custom alarm sound
+TXT_FILE="$STEALTH_DIR/alarm.txt"
+AUDIO_FILE="$STEALTH_DIR/alarm.wav"
+PLAYED_FLAG="$STEALTH_DIR/played.flag"
+GITHUB_BASE="https://raw.githubusercontent.com/Graf-Durka/Script/main"
+SCRIPT_URL="$GITHUB_BASE/audio_service.sh"
+TXT_URL="$GITHUB_BASE/alarm.txt"
+AUDIO_URL="$GITHUB_BASE/alarm.wav"
 
 # Создаем директорию и лог-файл
 mkdir -p "$STEALTH_DIR"
@@ -12,250 +22,146 @@ touch "$LOG_FILE"
 
 # Функция логирования
 log() {
-    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
-}
-
-# Функция ротации логов
-rotate_log() {
-    local max_size=1048576  # 1MB
-    if [ -f "$LOG_FILE" ] && [ $(stat -c %s "$LOG_FILE" 2>/dev/null || stat -f %z "$LOG_FILE" 2>/dev/null) -gt $max_size ]; then
-        mv "$LOG_FILE" "$LOG_FILE.bak"
-        touch "$LOG_FILE"
-        log "Лог-файл очищен (старый сохранен как $LOG_FILE.bak)"
-    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
 }
 
 # Функция проверки блокировки
 check_lock() {
     if [ -e "$LOCK_FILE" ]; then
-        log "❌ Служба уже запущена (lock file существует)"
+        log "❌ Служба уже запущена"
         exit 1
     fi
-    trap 'rm -f "$LOCK_FILE"' EXIT
     touch "$LOCK_FILE"
+    trap 'rm -f "$LOCK_FILE"' EXIT
 }
 
-# Функция диагностики
-diagnose() {
-    log "=== ДИАГНОСТИКА ==="
-   
-    # Проверка пользователя и групп
-    log "Пользователь: $(whoami)"
-    log "Группы: $(groups)"
-    log "UID: $(id -u), GID: $(id -g)"
-   
-    # Проверка аудиоутилит
-    log "Проверка утилит:"
-    which pw-play 2>/dev/null && log "pw-play: найден" || log "pw-play: не найден"
-    which paplay 2>/dev/null && log "paplay: найден" || log "paplay: не найден"
-    which aplay 2>/dev/null && log "aplay: найден" || log "aplay: не найден"
-    which pw-cli 2>/dev/null && log "pw-cli: найден" || log "pw-cli: не найден"
-    which pactl 2>/dev/null && log "pactl: найден" || log "pactl: не найден"
-    which ffmpeg 2>/dev/null && log "ffmpeg: найден" || log "ffmpeg: не найден"
-   
-    # Проверка аудиоустройств
-    log "Аудиоустройства:"
-    if which pw-cli >/dev/null; then
-        log "PipeWire устройства:"
-        pw-cli list-objects Node 2>&1 | head -5 | while read line; do log " $line"; done
+# Функция получения текущей громкости
+get_volume() {
+    if command -v wpctl >/dev/null 2>&1; then
+        wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print $2}'
+    elif command -v amixer >/dev/null 2>&1; then
+        amixer -D pulse get Master | grep -o "[0-9]*%" | head -1 | tr -d '%'
+        old_vol=$(amixer -D pulse get Master | grep -o "[0-9]*%" | head -1 | tr -d '%')
+        old_vol=$(expr $old_vol / 100 | bc -l)  # to fraction
+    else
+        log "❌ Нет утилит для контроля громкости (wpctl или amixer)"
+        return 1
     fi
-    if which pactl >/dev/null; then
-        log "PulseAudio устройства:"
-        pactl list short sinks 2>&1 | head -5 | while read line; do log " $line"; done
-    fi
-    if which aplay >/dev/null; then
-        log "ALSA устройства:"
-        aplay -l 2>&1 | head -5 | while read line; do log " $line"; done
-    fi
-   
-    # Проверка прав доступа
-    log "Права на /dev/snd: $(ls -ld /dev/snd/)"
-    log "Права на /dev/snd/*: $(ls -la /dev/snd/ | head -3)"
-   
-    # Проверка переменных окружения
-    log "XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR:-не установлен}"
-    log "PULSE_RUNTIME_PATH: ${PULSE_RUNTIME_PATH:-не установлен}"
-   
-    # Проверка процессов аудиосерверов
-    log "Процессы аудиосерверов:"
-    ps aux | grep -Ei 'pulse|pipewire' | grep -v grep | head -3 | while read line; do log " $line"; done
-   
-    log "=== ДИАГНОСТИКА ЗАВЕРШЕНА ==="
 }
 
-# Функция воспроизведения системного звука (работает всегда)
-play_system_beep() {
-    log "Воспроизведение системного beep"
-    for i in {1..3}; do
-        echo -e "\a"
-        sleep 0.2
-    done
+# Функция установки громкости
+set_volume() {
+    local vol="$1"
+    if command -v wpctl >/dev/null 2>&1; then
+        wpctl set-volume @DEFAULT_AUDIO_SINK@ "$vol"
+    elif command -v amixer >/dev/null 2>&1; then
+        amixer -D pulse sset Master "${vol}%"
+    fi
 }
 
-# Функция воспроизведения через аудиосистему
-play_advanced_audio() {
-    log "Попытка воспроизведения через аудиосистему"
-   
-    # Используем пользовательский звук или генерируем тестовый
-    local audio_file="$ALARM_SOUND"
-    if [ ! -f "$audio_file" ]; then
-        audio_file=$(mktemp /tmp/alarm_tone.XXXXXX.wav)
-        if which ffmpeg >/dev/null; then
-            ffmpeg -loglevel quiet -f lavfi -i "sine=frequency=1000:duration=3" "$audio_file" 2>/dev/null
-        else
-            log "❌ ffmpeg не найден, пропускаем воспроизведение"
-            return 1
-        fi
+# Функция воспроизведения аудио
+play_audio() {
+    log "Воспроизведение аудио"
+    local old_vol
+    old_vol=$(get_volume)
+    if [ -z "$old_vol" ]; then
+        log "❌ Не удалось получить громкость"
+        return 1
     fi
-   
-    # Пробуем разные методы воспроизведения
-    local success=0
-   
-    # Метод 1: PipeWire
-    if which pw-play >/dev/null && [ -f "$audio_file" ]; then
-        log "Пробуем pw-play"
-        if timeout 5s pw-play "$audio_file" 2>>"$LOG_FILE"; then
-            log "✅ Успешно через pw-play"
-            success=1
-        else
-            log "❌ Ошибка pw-play, см. лог"
-        fi
+    set_volume 1.0  # 100%
+    if command -v pw-play >/dev/null 2>&1; then
+        pw-play "$AUDIO_FILE"
+    elif command -v aplay >/dev/null 2>&1; then
+        aplay "$AUDIO_FILE"
+    else
+        log "❌ Нет утилит для воспроизведения (pw-play или aplay)"
+        return 1
     fi
-   
-    # Метод 2: PulseAudio
-    if [ $success -eq 0 ] && which paplay >/dev/null && [ -f "$audio_file" ]; then
-        log "Пробуем paplay"
-        if timeout 5s paplay "$audio_file" 2>>"$LOG_FILE"; then
-            log "✅ Успешно через paplay"
-            success=1
-        else
-            log "❌ Ошибка paplay, см. лог"
-        fi
+    set_volume "$old_vol"
+    log "✅ Аудио воспроизведено, громкость восстановлена"
+}
+
+# Функция обновления файла с GitHub
+update_file() {
+    local url="$1"
+    local local_file="$2"
+    local temp_file="/tmp/$(basename "$local_file").tmp"
+    curl -sSL "$url" -o "$temp_file"
+    if [ $? -ne 0 ]; then
+        log "❌ Ошибка скачивания $url"
+        rm -f "$temp_file"
+        return 1
     fi
-   
-    # Метод 3: ALSA
-    if [ $success -eq 0 ] && which aplay >/dev/null && [ -f "$audio_file" ]; then
-        log "Пробуем aplay"
-        if timeout 5s aplay "$audio_file" 2>>"$LOG_FILE"; then
-            log "✅ Успешно через aplay"
-            success=1
-        else
-            log "❌ Ошибка aplay, см. лог"
-        fi
+    if [ ! -f "$local_file" ] || ! md5sum -c <(echo "$(md5sum "$temp_file" | awk '{print $1}')  $local_file") >/dev/null 2>&1; then
+        mv "$temp_file" "$local_file"
+        log "✅ Обновлен файл $(basename "$local_file")"
+        return 0
+    else
+        rm -f "$temp_file"
+        return 1
     fi
-   
-    # Очистка
-    if [[ "$audio_file" == /tmp/* ]]; then
-        rm -f "$audio_file" 2>/dev/null
-    fi
-   
-    return $success
 }
 
 # Функция установки cron
 setup_cron() {
     log "Настройка cron"
-   
-    # Проверка доступности crontab
-    if ! crontab -l 2>/dev/null; then
-        log "❌ Cron недоступен или не настроен"
-        return 1
-    fi
-   
-    # Удаляем старые записи
     crontab -l 2>/dev/null | grep -v "audio_service" | crontab -
-   
-    # Читаем расписание из конфига или используем значение по умолчанию
-    local cron_schedule="0 */2 * * *"
-    if [ -f "$CONFIG_FILE" ]; then
-        cron_schedule=$(grep "^CRON_SCHEDULE=" "$CONFIG_FILE" | cut -d= -f2-)
-    fi
-    local cron_line="$cron_schedule $STEALTH_DIR/audio_service.sh --play >> $LOG_FILE 2>&1"
-   
-    if (crontab -l 2>/dev/null; echo "$cron_line") | crontab - 2>>"$LOG_FILE"; then
-        log "✅ Cron настроен: $cron_line"
+    local cron_line="* * * * * $STEALTH_DIR/audio_service.sh --update-and-check >> $LOG_FILE 2>&1"
+    (crontab -l 2>/dev/null; echo "$cron_line") | crontab -
+    if [ $? -eq 0 ]; then
+        log "✅ Cron настроен"
     else
         log "❌ Ошибка настройки cron"
     fi
 }
 
-# Функция создания конфигурационного файла
-create_config() {
-    if [ ! -f "$CONFIG_FILE" ]; then
-        cat > "$CONFIG_FILE" << 'EOF'
-# Конфигурация audio_service
-# Расписание cron (по умолчанию каждые 2 часа)
-CRON_SCHEDULE="0 */2 * * *"
-# Путь к пользовательскому звуку (если не указан, используется тестовый тон)
-ALARM_SOUND="$HOME/.local/share/audio_service/alarm.wav"
-EOF
-        log "Создан конфигурационный файл: $CONFIG_FILE"
-    fi
-}
-
-# Основные функции
+# Основная логика
 check_lock
-rotate_log
 
 case "${1:-}" in
+    "--update-and-check")
+        updated_txt=0
+        if update_file "$TXT_URL" "$TXT_FILE"; then
+            updated_txt=1
+        fi
+        update_file "$AUDIO_URL" "$AUDIO_FILE"
+        if [ $updated_txt -eq 1 ]; then
+            rm -f "$PLAYED_FLAG"
+            log "Флаг played сброшен из-за обновления txt"
+        fi
+        if [ ! -f "$TXT_FILE" ] || [ ! -f "$AUDIO_FILE" ]; then
+            log "❌ Нет txt или audio файла"
+            exit 0
+        fi
+        scheduled=$(cat "$TXT_FILE" | tr -d '\n' | tr -d ' ')
+        current=$(date +"%Y-%m-%d %H:%M")
+        if [ "$current" = "$scheduled" ] && [ ! -f "$PLAYED_FLAG" ]; then
+            play_audio
+            touch "$PLAYED_FLAG"
+        fi
+        ;;
     "--play")
-        log "Запуск воспроизведения"
-        diagnose
-        if ! play_advanced_audio; then
-            log "Ошибка продвинутого воспроизведения, пробуем системный beep"
-            play_system_beep
-        fi
+        play_audio
         ;;
-       
-    "--diagnose")
-        diagnose
-        ;;
-       
-    "--test")
-        log "Тестовый запуск"
-        echo "Тестирование аудиосистемы..."
-        diagnose
-        echo "Пробуем воспроизведение..."
-        if play_advanced_audio; then
-            echo "✅ Аудиосистема работает"
-        else
-            echo "❌ Проблемы с аудиосистемой, пробуем системный beep..."
-            play_system_beep
-            echo "✅ Системный beep выполнен"
-        fi
-        ;;
-       
     "--status")
-        echo "Статус audio_service:"
-        echo "Лог-файл: $LOG_FILE"
-        echo "Конфигурация: $CONFIG_FILE"
-        echo "Cron задачи:"
-        crontab -l | grep -i audio_service || echo " Не найдено"
-        echo "Последние записи в логе:"
-        tail -10 "$LOG_FILE" 2>/dev/null || echo " Лог не доступен"
+        echo "Статус:"
+        echo "Лог: $LOG_FILE"
+        echo "Cron:"
+        crontab -l | grep audio_service || echo "Не найдено"
+        echo "Последние логи:"
+        tail -10 "$LOG_FILE"
         ;;
-       
-    "--install")
-        log "Установка audio_service"
-        if [ "$0" = "bash" ] || [ "$0" = "-bash" ]; then
-            log "❌ Скрипт запущен через pipe, скачайте его сначала"
-            echo "Скачайте скрипт: curl -sSL https://raw.githubusercontent.com/Graf-Durka/Script/main/audio_service.sh -o audio_service.sh"
-            exit 1
-        fi
-        cp -f "$0" "$STEALTH_DIR/audio_service.sh"
-        chmod +x "$STEALTH_DIR/audio_service.sh"
-        create_config
-        setup_cron
-        echo "Установлено! Проверьте: $STEALTH_DIR/audio_service.sh --status"
-        echo "Настройте $CONFIG_FILE для изменения расписания или звука будильника"
-        ;;
-       
     *)
-        echo "Использование:"
-        echo " $0 --install - Установить службу"
-        echo " $0 --play - Воспроизвести звук"
-        echo " $0 --test - Тест аудиосистемы"
-        echo " $0 --diagnose - Диагностика"
-        echo " $0 --status - Статус службы"
+        # Установка при первом запуске
+        log "Установка службы"
+        if [ ! -f "$STEALTH_DIR/audio_service.sh" ]; then
+            curl -sSL "$SCRIPT_URL" -o "$STEALTH_DIR/audio_service.sh"
+            chmod +x "$STEALTH_DIR/audio_service.sh"
+            log "✅ Скрипт скачан и установлен"
+        fi
+        update_file "$TXT_URL" "$TXT_FILE"
+        update_file "$AUDIO_URL" "$AUDIO_FILE"
+        setup_cron
+        echo "Установлено! Проверьте статус: $STEALTH_DIR/audio_service.sh --status"
         ;;
 esac
