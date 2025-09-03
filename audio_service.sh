@@ -1,6 +1,4 @@
-#grok:render type="render_inline_citation">
-<argument name="citation_id">6</argument
-</grok:
+
 #!/bin/bash
 # audio_service.sh - Кастомный будильник с обновлением из GitHub
 
