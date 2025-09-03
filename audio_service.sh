@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # Конфигурация GitHub
-GITHUB_USER="your_username"
-GITHUB_REPO="your_repository"
+GITHUB_USER="Graf-Durka"
+GITHUB_REPO="script"
 GITHUB_BRANCH="main"
 
 # URL ресурсов на GitHub
