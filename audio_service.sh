@@ -2,7 +2,7 @@
 
 # Конфигурация GitHub
 GITHUB_USER="Graf-Durka"
-GITHUB_REPO="script"
+GITHUB_REPO="Script"
 GITHUB_BRANCH="main"
 
 # URL ресурсов на GitHub
