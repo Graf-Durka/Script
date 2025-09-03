@@ -101,7 +101,7 @@ update_file() {
 setup_cron() {
     log "Настройка cron"
     crontab -l 2>/dev/null | grep -v "audio_service" | crontab - || true
-    local cron_line="* * * * * $STEALTH_DIR/audio_service.sh --update-and-check >> $LOG_FILE 2>&1"
+    local cron_line="* * * * * XDG_RUNTIME_DIR=/run/user/$(id -u) $STEALTH_DIR/audio_service.sh --update-and-check >> $LOG_FILE 2>&1"
     (crontab -l 2>/dev/null; echo "$cron_line") | crontab - || { log "❌ Ошибка настройки cron"; exit 1; }
     log "✅ Cron настроен"
 }
