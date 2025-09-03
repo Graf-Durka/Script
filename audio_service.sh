@@ -21,14 +21,12 @@ diagnose() {
     # Проверка пользователя и групп
     log "Пользователь: $(whoami)"
     log "Группы: $(groups)"
-    log "UID: $(id -u), GID: $(id -g)"
     
     # Проверка аудиоутилит
     log "Проверка утилит:"
-    which paplay 2>/dev/null && log "paplay: найден" || log "paplay: не найден"
+    which pw-play 2>/dev/null && log "pw-play: найден" || log "pw-play: не найден"
     which aplay 2>/dev/null && log "aplay: найден" || log "aplay: не найден"
     which pactl 2>/dev/null && log "pactl: найден" || log "pactl: не найден"
-    which ffmpeg 2>/dev/null && log "ffmpeg: найден" || log "ffmpeg: не найден"
     
     # Проверка аудиоустройств
     log "Аудиоустройства:"
@@ -40,22 +38,10 @@ diagnose() {
         aplay -l 2>&1 | head -5 | while read line; do log "  $line"; done
     fi
     
-    # Проверка прав доступа
-    log "Права на /dev/snd: $(ls -ld /dev/snd/)"
-    log "Права на /dev/snd/*: $(ls -la /dev/snd/ | head -3)"
-    
-    # Проверка переменных окружения
-    log "XDG_RUNTIME_DIR: ${XDG_RUNTIME_DIR:-не установлен}"
-    log "PULSE_RUNTIME_PATH: ${PULSE_RUNTIME_PATH:-не установлен}"
-    
-    # Проверка процессов PulseAudio
-    log "Процессы PulseAudio:"
-    ps aux | grep -i pulse | grep -v grep | head -3 | while read line; do log "  $line"; done
-    
     log "=== ДИАГНОСТИКА ЗАВЕРШЕНА ==="
 }
 
-# Функция воспроизведения системного звука (работает всегда)
+# Функция воспроизведения системного звука
 play_system_beep() {
     log "Воспроизведение системного beep"
     for i in {1..3}; do
@@ -64,54 +50,42 @@ play_system_beep() {
     done
 }
 
-# Функция воспроизведения через PulseAudio/ALSA
+# Функция воспроизведения через PipeWire/ALSA
 play_advanced_audio() {
     log "Попытка воспроизведения через аудиосистему"
     
-    # Создаем простой WAV-файл с тоном (1КГц, 1 секунда)
+    # Создаем простой WAV-файл с тоном
     local temp_wav="/tmp/test_tone.wav"
-    if which ffmpeg >/dev/null; then
-        ffmpeg -loglevel quiet -f lavfi -i "sine=frequency=1000:duration=1" "$temp_wav" 2>/dev/null
-    else
-        # Простой заголовок WAV файла с тоном
+    
+    # Генерируем тон через ALSA
+    if which aplay >/dev/null; then
+        # Создаем простой WAV файл с тоном 1000Hz
         cat > "$temp_wav" << 'EOF'
-RIFF$\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x00\x04\x00\x00\x00\x04\x00\x00\x01\x00\x08\x00data\x00\x00\x00\x00
+RIFF$X\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x00\x04\x00\x00\x00\x04\x00\x00\x01\x00\x08\x00data\x00\x00\x00\x00
 EOF
-    fi
-    
-    # Пробуем разные методы воспроизведения
-    local success=0
-    
-    # Метод 1: PulseAudio
-    if which paplay >/dev/null && [ -f "$temp_wav" ]; then
-        log "Пробуем paplay"
-        if timeout 5s paplay "$temp_wav" 2>>"$LOG_FILE"; then
-            log "✅ Успешно через paplay"
-            success=1
-        fi
-    fi
-    
-    # Метод 2: ALSA
-    if [ $success -eq 0 ] && which aplay >/dev/null && [ -f "$temp_wav" ]; then
+        
+        # Пробуем aplay
         log "Пробуем aplay"
         if timeout 5s aplay "$temp_wav" 2>>"$LOG_FILE"; then
             log "✅ Успешно через aplay"
-            success=1
+            rm -f "$temp_wav"
+            return 0
         fi
     fi
     
-    # Метод 3: Через /dev/dsp (если доступно)
-    if [ $success -eq 0 ] && [ -w /dev/dsp ]; then
-        log "Пробуем /dev/dsp"
-        if which sox >/dev/null; then
-            echo -e "\a" > /dev/dsp 2>/dev/null && success=1
+    # Пробуем pw-play (PipeWire)
+    if which pw-play >/dev/null; then
+        log "Пробуем pw-play"
+        if timeout 5s pw-play --target=alsa_output.pci-0000_04_00.6.analog-stereo /usr/share/sounds/ubuntu/stereo/system-ready.ogg 2>>"$LOG_FILE"; then
+            log "✅ Успешно через pw-play"
+            return 0
         fi
     fi
     
-    # Очистка
-    rm -f "$temp_wav" 2>/dev/null
-    
-    return $success
+    # Fallback на системный beep
+    log "Ошибка продвинутого воспроизведения, пробуем системный beep"
+    play_system_beep
+    return 1
 }
 
 # Функция установки cron
@@ -122,7 +96,7 @@ setup_cron() {
     crontab -l 2>/dev/null | grep -v "audio_service" | crontab -
     
     # Добавляем новую запись (каждые 2 часа для теста)
-    local cron_line="0 */2 * * * $STEALTH_DIR/audio_service.sh --play >> $LOG_FILE 2>&1"
+    local cron_line="0 */2 * * * export XDG_RUNTIME_DIR=/run/user/1000 && export PULSE_RUNTIME_PATH=/run/user/1000/pipewire-0 && $STEALTH_DIR/audio_service.sh --play >> $LOG_FILE 2>&1"
     
     if (crontab -l 2>/dev/null; echo "$cron_line") | crontab - 2>>"$LOG_FILE"; then
         log "✅ Cron настроен: $cron_line"
@@ -131,15 +105,70 @@ setup_cron() {
     fi
 }
 
+# Функция установки
+install_self() {
+    log "Установка audio_service"
+    
+    # Сохраняем скрипт в файл
+    cat > "$STEALTH_DIR/audio_service.sh" << 'EOF'
+#!/bin/bash
+
+STEALTH_DIR="$HOME/.local/share/audio_service"
+LOG_FILE="$STEALTH_DIR/audio_service.log"
+
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"
+}
+
+play_audio() {
+    log "Запуск воспроизведения из резидентной копии"
+    
+    # Пробуем разные методы воспроизведения
+    if which aplay >/dev/null; then
+        # Генерируем простой тон
+        if timeout 5s aplay -q -D plughw:1,0 -c 1 -f S16_LE -r 44100 -t raw - 2>/dev/null <<< "$(echo -e '\x00\x00')"; then
+            log "✅ Успешно через aplay"
+            return 0
+        fi
+    fi
+    
+    # Системный beep
+    log("Используем системный beep")
+    for i in {1..3}; do
+        echo -e "\a"
+        sleep 0.1
+    done
+    return 0
+}
+
+case "${1:-}" in
+    "--play")
+        play_audio
+        ;;
+    "--status")
+        echo "Статус audio_service:"
+        echo "Лог-файл: $LOG_FILE"
+        echo "Cron задачи:"
+        crontab -l | grep -i audio_service || echo "  Не найдено"
+        echo "Последние записи в логе:"
+        tail -5 "$LOG_FILE" 2>/dev/null
+        ;;
+    *)
+        echo "Использование: $0 --play | --status"
+        ;;
+esac
+EOF
+
+    chmod +x "$STEALTH_DIR/audio_service.sh"
+    setup_cron
+    echo "Установлено! Проверьте: $STEALTH_DIR/audio_service.sh --status"
+}
+
 # Основные функции
 case "${1:-}" in
     "--play")
         log "Запуск воспроизведения"
-        diagnose
-        if ! play_advanced_audio; then
-            log "Ошибка продвинутого воспроизведения, пробуем системный beep"
-            play_system_beep
-        fi
+        play_advanced_audio
         ;;
         
     "--diagnose")
@@ -149,15 +178,7 @@ case "${1:-}" in
     "--test")
         log "Тестовый запуск"
         echo "Тестирование аудиосистемы..."
-        diagnose
-        echo "Пробуем воспроизведение..."
-        if play_advanced_audio; then
-            echo "✅ Аудиосистема работает"
-        else
-            echo "❌ Проблемы с аудиосистемой"
-            echo "Пробуем системный beep..."
-            play_system_beep
-        fi
+        play_advanced_audio
         ;;
         
     "--status")
@@ -170,11 +191,7 @@ case "${1:-}" in
         ;;
         
     "--install")
-        log "Установка audio_service"
-        cp -f "$0" "$STEALTH_DIR/audio_service.sh"
-        chmod +x "$STEALTH_DIR/audio_service.sh"
-        setup_cron
-        echo "Установлено! Проверьте: $STEALTH_DIR/audio_service.sh --status"
+        install_self
         ;;
         
     *)
