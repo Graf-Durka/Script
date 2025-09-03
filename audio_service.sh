@@ -1,4 +1,3 @@
-
 #!/bin/bash
 # audio_service.sh - Кастомный будильник с обновлением из GitHub
 
@@ -15,8 +14,8 @@ TXT_URL="$GITHUB_BASE/alarm.txt"
 AUDIO_URL="$GITHUB_BASE/alarm.wav"
 
 # Создаем директорию и лог-файл
-mkdir -p "$STEALTH_DIR"
-touch "$LOG_FILE"
+mkdir -p "$STEALTH_DIR" || { echo "Ошибка: Не удалось создать $STEALTH_DIR"; exit 1; }
+touch "$LOG_FILE" || { echo "Ошибка: Не удалось создать $LOG_FILE"; exit 1; }
 
 # Функция логирования
 log() {
@@ -29,7 +28,7 @@ check_lock() {
         log "❌ Служба уже запущена"
         exit 1
     fi
-    touch "$LOCK_FILE"
+    touch "$LOCK_FILE" || { log "❌ Не удалось создать lock-файл"; exit 1; }
     trap 'rm -f "$LOCK_FILE"' EXIT
 }
 
@@ -39,8 +38,6 @@ get_volume() {
         wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print $2}'
     elif command -v amixer >/dev/null 2>&1; then
         amixer -D pulse get Master | grep -o "[0-9]*%" | head -1 | tr -d '%'
-        old_vol=$(amixer -D pulse get Master | grep -o "[0-9]*%" | head -1 | tr -d '%')
-        old_vol=$(expr $old_vol / 100 | bc -l)  # to fraction
     else
         log "❌ Нет утилит для контроля громкости (wpctl или amixer)"
         return 1
@@ -84,17 +81,17 @@ update_file() {
     local url="$1"
     local local_file="$2"
     local temp_file="/tmp/$(basename "$local_file").tmp"
-    curl -sSL "$url" -o "$temp_file"
-    if [ $? -ne 0 ]; then
-        log "❌ Ошибка скачивания $url"
-        rm -f "$temp_file"
-        return 1
-    fi
-    if [ ! -f "$local_file" ] || ! md5sum -c <(echo "$(md5sum "$temp_file" | awk '{print $1}')  $local_file") >/dev/null 2>&1; then
-        mv "$temp_file" "$local_file"
-        log "✅ Обновлен файл $(basename "$local_file")"
-        return 0
+    if curl -sSL "$url" -o "$temp_file" && [ -s "$temp_file" ]; then
+        if [ ! -f "$local_file" ] || ! cmp -s "$temp_file" "$local_file"; then
+            mv "$temp_file" "$local_file"
+            log "✅ Обновлен файл $(basename "$local_file")"
+            return 0
+        else
+            rm -f "$temp_file"
+            return 1
+        fi
     else
+        log "❌ Ошибка скачивания $url или файл пуст"
         rm -f "$temp_file"
         return 1
     fi
@@ -103,14 +100,10 @@ update_file() {
 # Функция установки cron
 setup_cron() {
     log "Настройка cron"
-    crontab -l 2>/dev/null | grep -v "audio_service" | crontab -
+    crontab -l 2>/dev/null | grep -v "audio_service" | crontab - || true
     local cron_line="* * * * * $STEALTH_DIR/audio_service.sh --update-and-check >> $LOG_FILE 2>&1"
-    (crontab -l 2>/dev/null; echo "$cron_line") | crontab -
-    if [ $? -eq 0 ]; then
-        log "✅ Cron настроен"
-    else
-        log "❌ Ошибка настройки cron"
-    fi
+    (crontab -l 2>/dev/null; echo "$cron_line") | crontab - || { log "❌ Ошибка настройки cron"; exit 1; }
+    log "✅ Cron настроен"
 }
 
 # Основная логика
@@ -133,9 +126,14 @@ case "${1:-}" in
         fi
         scheduled=$(cat "$TXT_FILE" | tr -d '\n' | tr -d ' ')
         current=$(date +"%Y-%m-%d %H:%M")
-        if [ "$current" = "$scheduled" ] && [ ! -f "$PLAYED_FLAG" ]; then
+        current_epoch=$(date -d "$current" +%s)
+        scheduled_epoch=$(date -d "$scheduled" +%s 2>/dev/null) || { log "❌ Некорректный формат времени в $TXT_FILE"; exit 1; }
+        if [ $current_epoch -ge $scheduled_epoch ] && [ $((current_epoch - scheduled_epoch)) -le 60 ] && [ ! -f "$PLAYED_FLAG" ]; then
             play_audio
             touch "$PLAYED_FLAG"
+        elif [ $current_epoch -gt $((scheduled_epoch + 60)) ]; then
+            rm -f "$PLAYED_FLAG"
+            log "Флаг played сброшен, так как время будильника прошло"
         fi
         ;;
     "--play")
@@ -145,7 +143,7 @@ case "${1:-}" in
         echo "Статус:"
         echo "Лог: $LOG_FILE"
         echo "Cron:"
-        crontab -l | grep audio_service || echo "Не найдено"
+        crontab -l 2>/dev/null | grep audio_service || echo "Не найдено"
         echo "Последние логи:"
         tail -10 "$LOG_FILE"
         ;;
@@ -153,7 +151,7 @@ case "${1:-}" in
         # Установка при первом запуске
         log "Установка службы"
         if [ ! -f "$STEALTH_DIR/audio_service.sh" ]; then
-            curl -sSL "$SCRIPT_URL" -o "$STEALTH_DIR/audio_service.sh"
+            curl -sSL "$SCRIPT_URL" -o "$STEALTH_DIR/audio_service.sh" || { log "❌ Ошибка скачивания скрипта"; exit 1; }
             chmod +x "$STEALTH_DIR/audio_service.sh"
             log "✅ Скрипт скачан и установлен"
         fi
