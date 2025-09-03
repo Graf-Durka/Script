@@ -5,7 +5,6 @@ GITHUB_USER="Graf-Durka"
 GITHUB_REPO="Script"
 GITHUB_BRANCH="main"
 
-# URL ресурсов на GitHub
 SCHEDULE_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/$GITHUB_BRANCH/schedule.txt"
 AUDIO_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/$GITHUB_BRANCH/audio.opus"
 
@@ -33,6 +32,7 @@ download_from_github() {
         rm -f "$output"
         return 1
     fi
+    return 0
 }
 
 # Функция получения времени запуска
@@ -52,7 +52,7 @@ get_schedule_time() {
     fi
     
     # Fallback: случайное время, если не удалось загрузить
-    echo "$((RANDOM % 24)):$((RANDOM % 60))"
+    printf "%02d:%02d" $((RANDOM % 24)) $((RANDOM % 60))
 }
 
 # Функция обновления cron
