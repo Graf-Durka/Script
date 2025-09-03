@@ -34,12 +34,13 @@ check_lock() {
 
 # Функция получения текущей громкости
 get_volume() {
-    if command -v wpctl >/dev/null 2>&1; then
-        wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print $2}'
-    elif command -v amixer >/dev/null 2>&1; then
+    if command -v wpctl >/dev/null 2>&1 && XDG_RUNTIME_DIR=/run/user/$(id -u) wpctl get-volume @DEFAULT_AUDIO_SINK@ >/dev/null 2>&1; then
+        XDG_RUNTIME_DIR=/run/user/$(id -u) wpctl get-volume @DEFAULT_AUDIO_SINK@ | awk '{print $2}'
+    elif command -v amixer >/dev/null 2>&1 && amixer -D pulse get Master >/dev/null 2>&1; then
         amixer -D pulse get Master | grep -o "[0-9]*%" | head -1 | tr -d '%'
     else
-        log "❌ Нет утилит для контроля громкости (wpctl или amixer)"
+        log "❌ Нет утилит для контроля громкости или аудиосервер недоступен, использую громкость по умолчанию (100)"
+        echo "100"
         return 1
     fi
 }
@@ -57,19 +58,24 @@ set_volume() {
 # Функция воспроизведения аудио
 play_audio() {
     log "Воспроизведение аудио"
+    if [ ! -f "$AUDIO_FILE" ]; then
+        log "❌ Аудиофайл $AUDIO_FILE отсутствует"
+        return 1
+    fi
     local old_vol
     old_vol=$(get_volume)
     if [ -z "$old_vol" ]; then
-        log "❌ Не удалось получить громкость"
-        return 1
+        log "❌ Не удалось получить громкость, продолжаем с максимальной громкостью"
+        old_vol=100
     fi
     set_volume 1.0  # 100%
-    if command -v pw-play >/dev/null 2>&1; then
-        pw-play "$AUDIO_FILE"
-    elif command -v aplay >/dev/null 2>&1; then
-        aplay "$AUDIO_FILE"
+    if command -v pw-play >/dev/null 2>&1 && XDG_RUNTIME_DIR=/run/user/$(id -u) pw-play "$AUDIO_FILE" 2>/dev/null; then
+        log "✅ Аудио воспроизведено с помощью pw-play"
+    elif command -v aplay >/dev/null 2>&1 && aplay "$AUDIO_FILE" 2>/dev/null; then
+        log "✅ Аудио воспроизведено с помощью aplay"
     else
-        log "❌ Нет утилит для воспроизведения (pw-play или aplay)"
+        log "❌ Не удалось воспроизвести аудио: нет утилит (pw-play или aplay) или файл недоступен"
+        set_volume "$old_vol"
         return 1
     fi
     set_volume "$old_vol"
