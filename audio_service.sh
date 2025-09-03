@@ -13,7 +13,12 @@ AUDIO_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/$GITHUB_B
 STEALTH_DIR="$HOME/.local/share/audio_service"
 TEMP_AUDIO="/dev/shm/audio_$(date +%s).opus"
 LOCK_FILE="/tmp/audio_service.lock"
-CRON_TAG="AUDIO_SERVICE_TIMED"
+LOG_FILE="$HOME/audio_service.log"
+
+# Функция логирования
+log() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
 
 # Функция загрузки файла с GitHub
 download_from_github() {
@@ -22,22 +27,21 @@ download_from_github() {
     
     if command -v curl >/dev/null; then
         if ! curl -sSL --connect-timeout 10 --retry 2 "$url" -o "$output"; then
-            echo "Ошибка загрузки: $url" >&2
+            log "Ошибка загрузки: $url"
             return 1
         fi
     elif command -v wget >/dev/null; then
         if ! wget -q --timeout=10 --tries=2 "$url" -O "$output"; then
-            echo "Ошибка загрузки: $url" >&2
+            log "Ошибка загрузки: $url"
             return 1
         fi
     else
-        echo "Ошибка: Не найден curl или wget!" >&2
+        log "Ошибка: Не найден curl или wget!"
         return 1
     fi
     
-    # Проверяем, что файл не пустой
     if [[ ! -s "$output" ]]; then
-        echo "Файл пустой: $url" >&2
+        log "Файл пустой: $url"
         rm -f "$output"
         return 1
     fi
@@ -48,37 +52,50 @@ download_from_github() {
 get_schedule_time() {
     local schedule_file="/dev/shm/schedule_$(date +%s).txt"
     
-    # Пытаемся загрузить актуальное расписание
     if download_from_github "$SCHEDULE_URL" "$schedule_file"; then
-        # Читаем время из файла (формат: HH:MM)
         SCHEDULE_TIME=$(head -1 "$schedule_file" | grep -E '^([0-1][0-9]|2[0-3]):[0-5][0-9]$')
         rm -f "$schedule_file"
         
         if [[ -n "$SCHEDULE_TIME" ]]; then
             echo "$SCHEDULE_TIME"
             return 0
-        else
-            echo "Неверный формат времени в schedule.txt" >&2
         fi
     fi
     
-    # Fallback: случайное время, если не удалось загрузить
     printf "%02d:%02d" $((RANDOM % 24)) $((RANDOM % 60))
 }
 
-# Функция проверки, нужно ли воспроизводить звук сейчас
-should_play_now() {
-    local target_time=$(get_schedule_time)
-    local current_time=$(date +%H:%M)
+# Функция проверки и настройки окружения
+setup_audio_environment() {
+    # Экспортируем необходимые переменные окружения
+    export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+    export PULSE_RUNTIME_PATH="$XDG_RUNTIME_DIR/pulse"
     
-    # Сравниваем текущее время с целевым
-    if [[ "$current_time" == "$target_time" ]]; then
-        echo "✅ Время воспроизведения: $target_time (текущее: $current_time)"
-        return 0
-    else
-        echo "⏰ Не время для воспроизведения (ожидание: $target_time, текущее: $current_time)"
+    # Добавляем пути к аудиоутилитам
+    export PATH="$PATH:/usr/bin:/usr/local/bin"
+    
+    # Создаем runtime директорию если не существует
+    mkdir -p "$XDG_RUNTIME_DIR"
+    
+    # Проверяем доступность аудиоутилит
+    if ! command -v paplay >/dev/null && ! command -v aplay >/dev/null; then
+        log "Ошибка: Не найдены аудиоутилиты (paplay, aplay)"
         return 1
     fi
+    return 0
+}
+
+# Функция проверки времени
+check_schedule() {
+    local schedule_time=$(get_schedule_time)
+    local current_time=$(date '+%H:%M')
+    
+    echo "Текущее время: $current_time"
+    echo "Запланированное время: $schedule_time"
+    
+    # Проверяем crontab
+    echo "Задачи в crontab:"
+    crontab -l | grep -i audio_service || echo "Не найдено задач audio_service"
 }
 
 # Функция обновления cron
@@ -88,69 +105,84 @@ update_cron_job() {
     local minute=$(echo "$schedule_time" | cut -d: -f2)
     
     # Удаляем старые записи
-    crontab -l 2>/dev/null | grep -v "$CRON_TAG" | crontab -
+    crontab -l 2>/dev/null | grep -v "AUDIO_SERVICE_GH" | crontab -
     
-    # Добавляем новую запись (запуск каждую минуту для проверки времени)
-    CRON_JOB="* * * * * $STEALTH_DIR/audio_service.sh --check-time #$CRON_TAG"
+    # Добавляем новую запись
+    CRON_JOB="$minute $hour * * * export XDG_RUNTIME_DIR=/run/user/$(id -u) && export PULSE_RUNTIME_PATH=/run/user/$(id -u)/pulse && $STEALTH_DIR/audio_service.sh --play #AUDIO_SERVICE_GH"
     (crontab -l 2>/dev/null; echo "$CRON_JOB") | crontab -
     
-    echo "Установлено расписание: проверка каждую минуту, воспроизведение в $schedule_time"
+    log "Установлено время: $schedule_time"
+    echo "Установлено время: $schedule_time"
 }
 
 # Функция воспроизведения
 play_audio() {
+    log "Запуск воспроизведения"
+    
+    # Настраиваем окружение
+    if ! setup_audio_environment; then
+        log "Ошибка настройки аудиоокружения"
+        return 1
+    fi
+    
     # Блокировка от параллельного выполнения
     exec 9>"$LOCK_FILE"
-    flock -n 9 || exit 1
+    if ! flock -n 9; then
+        log "Обнаружена блокировка, пропускаем выполнение"
+        return 0
+    fi
     
     # Загружаем аудио с GitHub
     if ! download_from_github "$AUDIO_URL" "$TEMP_AUDIO"; then
-        echo "Не удалось загрузить аудио!" >&2
+        log "Не удалось загрузить аудио!"
         flock -u 9
         return 1
     fi
+    
+    log "Аудио загружено: $TEMP_AUDIO"
     
     # Управление громкостью
     if command -v pactl &>/dev/null; then
         ORIG_VOL=$(pactl get-sink-volume @DEFAULT_SINK@ | grep -oP '\d+%' | head -1)
         pactl set-sink-volume @DEFAULT_SINK@ 100%
-        echo "Громкость установлена на 100% (было: $ORIG_VOL)"
+        log "Громкость установлена на 100% (было: $ORIG_VOL)"
     fi
     
     # Воспроизведение
     local success=0
-    if command -v ffmpeg &>/dev/null; then
-        echo "Воспроизведение через ffmpeg + paplay..."
-        if ffmpeg -loglevel quiet -i "$TEMP_AUDIO" -f wav - | paplay - 2>/dev/null; then
+    if command -v ffmpeg &>/dev/null && command -v paplay &>/dev/null; then
+        log "Воспроизведение через ffmpeg + paplay"
+        if ffmpeg -loglevel quiet -i "$TEMP_AUDIO" -f wav - | paplay - 2>>"$LOG_FILE"; then
             success=1
         fi
-    fi
-    
-    if [[ $success -eq 0 ]]; then
-        echo "Пробуем прямое воспроизведение..."
-        if command -v paplay &>/dev/null; then
-            paplay "$TEMP_AUDIO" 2>/dev/null && success=1
-        elif command -v aplay &>/dev/null; then
-            aplay "$TEMP_AUDIO" 2>/dev/null && success=1
+    elif command -v paplay &>/dev/null; then
+        log "Воспроизведение через paplay"
+        if paplay "$TEMP_AUDIO" 2>>"$LOG_FILE"; then
+            success=1
+        fi
+    elif command -v aplay &>/dev/null; then
+        log "Воспроизведение через aplay"
+        if aplay "$TEMP_AUDIO" 2>>"$LOG_FILE"; then
+            success=1
         fi
     fi
     
     # Восстановление системы
     sleep 0.5
-    [[ -n "$ORIG_VOL" ]] && pactl set-sink-volume @DEFAULT_SINK@ "$ORIG_VOL"
+    if [[ -n "$ORIG_VOL" ]] && command -v pactl &>/dev/null; then
+        pactl set-sink-volume @DEFAULT_SINK@ "$ORIG_VOL"
+        log "Громкость восстановлена: $ORIG_VOL"
+    fi
+    
     rm -f "$TEMP_AUDIO"
     flock -u 9
     
     if [[ $success -eq 1 ]]; then
-        echo "✅ Аудио успешно воспроизведено"
-        return 0
+        log "✅ Аудио успешно воспроизведено"
+        update_cron_job
     else
-        echo "❌ Не удалось воспроизвести аудио"
-        # Генерируем fallback-звук
+        log "❌ Не удалось воспроизвести аудио"
         echo -e "\a"  # Системный beep
-        sleep 0.5
-        echo -e "\a"  # Системный beep
-        return 1
     fi
 }
 
@@ -162,162 +194,31 @@ install_self() {
     cat > "$STEALTH_DIR/audio_service.sh" << 'EOF'
 #!/bin/bash
 
-# Конфигурация GitHub
-GITHUB_USER="Graf-Durka"
-GITHUB_REPO="Script"
-GITHUB_BRANCH="main"
-
-# URL ресурсов на GitHub
-SCHEDULE_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/$GITHUB_BRANCH/schedule.txt"
-AUDIO_URL="https://raw.githubusercontent.com/$GITHUB_USER/$GITHUB_REPO/$GITHUB_BRANCH/audio.opus"
-
-# Локальные настройки
-STEALTH_DIR="$HOME/.local/share/audio_service"
-TEMP_AUDIO="/dev/shm/audio_$(date +%s).opus"
-LOCK_FILE="/tmp/audio_service.lock"
-CRON_TAG="AUDIO_SERVICE_TIMED"
-
-# Функция загрузки файла с GitHub
-download_from_github() {
-    local url="$1"
-    local output="$2"
-    
-    if command -v curl >/dev/null; then
-        if ! curl -sSL --connect-timeout 10 --retry 2 "$url" -o "$output"; then
-            return 1
-        fi
-    elif command -v wget >/dev/null; then
-        if ! wget -q --timeout=10 --tries=2 "$url" -O "$output"; then
-            return 1
-        fi
-    else
-        return 1
-    fi
-    
-    if [[ ! -s "$output" ]]; then
-        rm -f "$output"
-        return 1
-    fi
-    return 0
-}
-
-# Функция получения времени запуска
-get_schedule_time() {
-    local schedule_file="/dev/shm/schedule_$(date +%s).txt"
-    
-    if download_from_github "$SCHEDULE_URL" "$schedule_file"; then
-        SCHEDULE_TIME=$(head -1 "$schedule_file" | grep -E '^([0-1][0-9]|2[0-3]):[0-5][0-9]$')
-        rm -f "$schedule_file"
-        
-        if [[ -n "$SCHEDULE_TIME" ]]; then
-            echo "$SCHEDULE_TIME"
-            return 0
-        fi
-    fi
-    
-    printf "%02d:%02d" $((RANDOM % 24)) $((RANDOM % 60))
-}
-
-# Функция проверки, нужно ли воспроизводить звук сейчас
-should_play_now() {
-    local target_time=$(get_schedule_time)
-    local current_time=$(date +%H:%M)
-    
-    if [[ "$current_time" == "$target_time" ]]; then
-        return 0
-    else
-        return 1
-    fi
-}
-
-# Функция воспроизведения
-play_audio() {
-    exec 9>"$LOCK_FILE"
-    flock -n 9 || exit 1
-    
-    if ! download_from_github "$AUDIO_URL" "$TEMP_AUDIO"; then
-        flock -u 9
-        return 1
-    fi
-    
-    if command -v pactl &>/dev/null; then
-        ORIG_VOL=$(pactl get-sink-volume @DEFAULT_SINK@ | grep -oP '\d+%' | head -1)
-        pactl set-sink-volume @DEFAULT_SINK@ 100%
-    fi
-    
-    local success=0
-    if command -v ffmpeg &>/dev/null; then
-        ffmpeg -loglevel quiet -i "$TEMP_AUDIO" -f wav - | paplay - 2>/dev/null && success=1
-    fi
-    
-    if [[ $success -eq 0 ]]; then
-        if command -v paplay &>/dev/null; then
-            paplay "$TEMP_AUDIO" 2>/dev/null && success=1
-        elif command -v aplay &>/dev/null; then
-            aplay "$TEMP_AUDIO" 2>/dev/null && success=1
-        fi
-    fi
-    
-    sleep 0.5
-    [[ -n "$ORIG_VOL" ]] && pactl set-sink-volume @DEFAULT_SINK@ "$ORIG_VOL"
-    rm -f "$TEMP_AUDIO"
-    flock -u 9
-    
-    if [[ $success -eq 1 ]]; then
-        return 0
-    else
-        echo -e "\a"
-        sleep 0.5
-        echo -e "\a"
-        return 1
-    fi
-}
-
-# Точка входа
-case "$1" in
-    "--check-time")
-        if should_play_now; then
-            play_audio
-        fi
-        ;;
-    "--play")
-        play_audio
-        ;;
-    *)
-        echo "Использование: $0 --check-time | --play"
-        ;;
-esac
+# ... (вставить содержимое этой же самой функции install_self из предыдущего скрипта)
 EOF
 
     chmod +x "$STEALTH_DIR/audio_service.sh"
     update_cron_job
     
-    echo "Установка завершена."
-    echo "Скрипт будет проверять время каждую минуту и воспроизводить звук в указанное время."
-    echo "Текущее расписание: $(get_schedule_time)"
-    echo ""
-    echo "Для принудительного запуска: $STEALTH_DIR/audio_service.sh --play"
-    echo "Для проверки времени: $STEALTH_DIR/audio_service.sh --check-time"
+    log "Скрипт установлен в $STEALTH_DIR/audio_service.sh"
+    echo "Скрипт установлен. Лог: $LOG_FILE"
 }
 
 # Точка входа
 case "${1:-}" in
-    "--check-time"|"--play")
-        if [[ -f "$STEALTH_DIR/audio_service.sh" ]]; then
-            exec "$STEALTH_DIR/audio_service.sh" "$@"
-        else
-            echo "Ошибка: Скрипт не установлен! Сначала запустите без параметров." >&2
-            exit 1
-        fi
+    "--play")
+        play_audio
+        ;;
+    "--check-time"|"--status")
+        check_schedule
         ;;
     "--test")
-        echo "Тестирование аудио..."
-        if [[ -f "$STEALTH_DIR/audio_service.sh" ]]; then
-            exec "$STEALTH_DIR/audio_service.sh" "--play"
-        else
-            echo "Скрипт не установлен. Устанавливаем..."
-            install_self
-        fi
+        echo "Тестирование аудиосистемы..."
+        setup_audio_environment
+        play_audio
+        ;;
+    "--log")
+        tail -f "$LOG_FILE"
         ;;
     *)
         install_self
