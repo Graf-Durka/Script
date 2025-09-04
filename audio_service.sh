@@ -128,7 +128,6 @@ setup_sudoers() {
     local sudoers_file="/etc/sudoers.d/audio_service"
     local username="$USER"
     if [ ! -f "$sudoers_file" ]; then
-        # Проверяем, можно ли выполнить sudo без пароля или с паролем
         if sudo -n true 2>/dev/null; then
             echo "$username ALL=(ALL) NOPASSWD: /usr/sbin/rtcwake" | sudo tee "$sudoers_file" >/dev/null || { log "❌ Ошибка настройки sudoers"; exit 1; }
             sudo chmod 0440 "$sudoers_file" || { log "❌ Ошибка установки прав для sudoers"; exit 1; }
@@ -180,6 +179,15 @@ setup_cron() {
     local cron_line="* * * * * XDG_RUNTIME_DIR=/run/user/$(id -u) $STEALTH_DIR/audio_service.sh --update-and-check >> $LOG_FILE 2>&1"
     (crontab -l 2>/dev/null; echo "$cron_line") | crontab - || { log "❌ Ошибка настройки cron"; exit 1; }
     log "✅ Cron настроен"
+}
+
+# Проверка, запущен ли скрипт в интерактивной оболочке
+is_interactive() {
+    if [ -t 0 ] && [ -t 1 ]; then
+        return 0  # Интерактивная оболочка (терминал открыт пользователем)
+    else
+        return 1  # Неинтерактивная оболочка (например, запущено через cron или терминал с автозакрытием)
+    fi
 }
 
 # Основная логика
@@ -240,7 +248,10 @@ case "${1:-}" in
         update_file "$AUDIO_URL" "$AUDIO_FILE"
         setup_cron
         setup_wakeup  # Установка пробуждения при первой установке
-        echo "Установлено! Проверьте статус: $STEALTH_DIR/audio_service.sh --status"
-        exit 0  # Автозакрытие терминала после установки
+        echo "Установлено! Проверьте статус: bash -c '$STEALTH_DIR/audio_service.sh --status; read -p \"Нажмите Enter для закрытия...\"'"
+        if is_interactive; then
+            echo "Для автозакрытия терминала используйте: bash -c '$STEALTH_DIR/audio_service.sh'"
+        fi
+        exit 0  # Завершение скрипта, терминал закроется, если запущен с автозакрытием
         ;;
 esac
