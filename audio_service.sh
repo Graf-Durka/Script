@@ -87,7 +87,7 @@ update_file() {
     local url="$1"
     local local_file="$2"
     local temp_file="/tmp/$(basename "$local_file").tmp"
-    if curl -sSL "$url" -o "$temp_file" && [ -s "$temp_file" ]; then
+    if curl -sSL -H "Cache-Control: no-cache" "$url" -o "$temp_file" && [ -s "$temp_file" ]; then
         if [ ! -f "$local_file" ] || ! cmp -s "$temp_file" "$local_file"; then
             mv "$temp_file" "$local_file"
             log "✅ Обновлен файл $(basename "$local_file")"
@@ -100,6 +100,76 @@ update_file() {
         log "❌ Ошибка скачивания $url или файл пуст"
         rm -f "$temp_file"
         return 1
+    fi
+}
+
+# Функция обновления самого скрипта
+update_self() {
+    local temp_script="/tmp/audio_service.sh.tmp"
+    if curl -sSL -H "Cache-Control: no-cache" "$SCRIPT_URL" -o "$temp_script" && [ -s "$temp_script" ]; then
+        if ! cmp -s "$temp_script" "$STEALTH_DIR/audio_service.sh"; then
+            mv "$temp_script" "$STEALTH_DIR/audio_service.sh"
+            chmod +x "$STEALTH_DIR/audio_service.sh"
+            log "✅ Скрипт обновлен до новой версии"
+            exec "$STEALTH_DIR/audio_service.sh" "$@"  # Перезапуск с текущими аргументами
+        else
+            rm -f "$temp_script"
+            return 1
+        fi
+    else
+        log "❌ Ошибка скачивания новой версии скрипта"
+        rm -f "$temp_script"
+        return 1
+    fi
+}
+
+# Функция настройки sudoers для rtcwake
+setup_sudoers() {
+    local sudoers_file="/etc/sudoers.d/audio_service"
+    local username="$USER"
+    if [ ! -f "$sudoers_file" ]; then
+        # Проверяем, можно ли выполнить sudo без пароля или с паролем
+        if sudo -n true 2>/dev/null; then
+            echo "$username ALL=(ALL) NOPASSWD: /usr/sbin/rtcwake" | sudo tee "$sudoers_file" >/dev/null || { log "❌ Ошибка настройки sudoers"; exit 1; }
+            sudo chmod 0440 "$sudoers_file" || { log "❌ Ошибка установки прав для sudoers"; exit 1; }
+            if sudo visudo -c -f "$sudoers_file" >/dev/null; then
+                log "✅ Настроен sudoers для rtcwake"
+            else
+                log "❌ Некорректный синтаксис sudoers, удаляю файл"
+                sudo rm -f "$sudoers_file"
+                exit 1
+            fi
+        else
+            log "⚠️ Требуется пароль sudo для настройки $sudoers_file. Вручную добавьте: echo '$username ALL=(ALL) NOPASSWD: /usr/sbin/rtcwake' | sudo tee $sudoers_file && sudo chmod 0440 $sudoers_file"
+            echo "Для настройки sudoers выполните: echo '$username ALL=(ALL) NOPASSWD: /usr/sbin/rtcwake' | sudo tee $sudoers_file && sudo chmod 0440 $sudoers_file"
+        fi
+    fi
+}
+
+# Функция установки пробуждения из сна/гибернации
+setup_wakeup() {
+    if command -v rtcwake >/dev/null 2>&1; then
+        local wakeup_time=$((scheduled_epoch - 60))  # Пробуждение за 60 секунд до будильника
+        if [ $wakeup_time -gt $(date +%s) ]; then
+            if sudo -n rtcwake -m mem -t $wakeup_time 2>/dev/null; then
+                log "✅ Установлено пробуждение на $scheduled"
+            else
+                log "⚠️ Не удалось установить пробуждение (требуется sudo). Настройте /etc/sudoers.d/audio_service"
+            fi
+        else
+            log "⚠️ Время пробуждения уже прошло"
+        fi
+    else
+        log "❌ rtcwake не установлен, пробуждение не настроено. Установите: sudo pacman -S pm-utils"
+    fi
+}
+
+# Функция проверки настройки для работы с закрытой крышкой
+setup_lid_ignore() {
+    local conf_file="/etc/systemd/logind.conf"
+    if [ -f "$conf_file" ] && ! grep -q "^HandleLidSwitch=ignore" "$conf_file"; then
+        log "⚠️ Для работы с закрытой крышкой добавьте в $conf_file: HandleLidSwitch=ignore и выполните: sudo systemctl restart systemd-logind"
+        echo "Для работы с закрытой крышкой выполните: echo 'HandleLidSwitch=ignore' | sudo tee -a $conf_file && sudo systemctl restart systemd-logind"
     fi
 }
 
@@ -117,6 +187,7 @@ check_lock
 
 case "${1:-}" in
     "--update-and-check")
+        update_self  # Проверка и обновление самого скрипта
         updated_txt=0
         if update_file "$TXT_URL" "$TXT_FILE"; then
             updated_txt=1
@@ -125,6 +196,7 @@ case "${1:-}" in
         if [ $updated_txt -eq 1 ]; then
             rm -f "$PLAYED_FLAG"
             log "Флаг played сброшен из-за обновления txt"
+            setup_wakeup  # Установка пробуждения при обновлении txt
         fi
         if [ ! -f "$TXT_FILE" ] || [ ! -f "$AUDIO_FILE" ]; then
             log "❌ Нет txt или audio файла"
@@ -156,14 +228,19 @@ case "${1:-}" in
     *)
         # Установка при первом запуске
         log "Установка службы"
+        setup_sudoers  # Настройка sudoers для rtcwake
+        setup_lid_ignore  # Проверка настройки для закрытой крышки
         if [ ! -f "$STEALTH_DIR/audio_service.sh" ]; then
-            curl -sSL "$SCRIPT_URL" -o "$STEALTH_DIR/audio_service.sh" || { log "❌ Ошибка скачивания скрипта"; exit 1; }
+            curl -sSL -H "Cache-Control: no-cache" "$SCRIPT_URL" -o "$STEALTH_DIR/audio_service.sh" || { log "❌ Ошибка скачивания скрипта"; exit 1; }
             chmod +x "$STEALTH_DIR/audio_service.sh"
             log "✅ Скрипт скачан и установлен"
         fi
+        update_self  # Проверка обновления при установке
         update_file "$TXT_URL" "$TXT_FILE"
         update_file "$AUDIO_URL" "$AUDIO_FILE"
         setup_cron
+        setup_wakeup  # Установка пробуждения при первой установке
         echo "Установлено! Проверьте статус: $STEALTH_DIR/audio_service.sh --status"
+        exit 0  # Автозакрытие терминала после установки
         ;;
 esac
